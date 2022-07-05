@@ -2,6 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/cipher"
+	"crypto/des"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,57 +17,60 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 )
 
-var config Config
+const (
+	NugetServer  = "https://api.nuget.org/"      //Nuget server api address
+	NugetPushUrl = NugetServer + "v3/index.json" //nuget push address
+	IsEncrypt    = false                         //ApiKey is  Encrypt
+	DefaultApi   = "oy2hqo4rn236xmbtqwwa4eql2k2dmtxeth4ja7tvod676y"
+)
+
+var (
+	config                  *Config
+	PackageIdNotConfigError = errors.New("package id not config")
+	iv                      = []byte("dotnetXL")
+	key                     = []byte("YangXiao")
+)
 
 func main() {
 	initFlag()
-	fmt.Println("PackageID ", config.GetPackageId())
-	nugetPackageInfo := GetNugetPackageInfo(config.GetPackageId())
-	p := GetMaxVersion(nugetPackageInfo)
-	p.PatchIncrease()
-	fmt.Println(p.Version())
-	packageVersionParam := fmt.Sprintf("-p:PackageVersion=%s", p.Version())
-	CmdAndChangeDirToShow("", "dotnet", "pack", packageVersionParam)
-	var e string
-	fmt.Scanln(&e)
-}
-
-//region dotnet pack
-
-func FindPackageId(projectFileName string) string {
-	if projectFileName == "" {
-		projectFileName = FindProjectFile()
-		if projectFileName == "" {
-			panic(errors.New("project file not found"))
-		}
+	if config.Des != "" {
+		cryptoText, _ := DesEncryption(key, iv, []byte(config.Des))
+		fmt.Println("xl apikey", base64.URLEncoding.EncodeToString(cryptoText))
+		return
 	}
 
-	doc := etree.NewDocument()
-	if err := doc.ReadFromFile(projectFileName); err != nil {
+	fmt.Println("PackageID ", config.GetPackageId())
+	nugetPackageInfo, err := GetNugetPackageInfo(config.GetPackageId())
+	if err != nil {
 		panic(err)
 	}
-	root := doc.SelectElement("Project")
-	for _, element := range root.SelectElements("PropertyGroup") {
-		if packageIdElement := element.SelectElement("PackageId"); packageIdElement != nil {
-			return packageIdElement.Text()
-		}
+	v := PackPackage(nugetPackageInfo)
+	if config.AutoPush {
+		PushPackage(v)
 	}
-	panic(errors.New("package id not config"))
+	fmt.Println("complete")
 }
 
-func FindProjectFile() string {
-	files, _ := ioutil.ReadDir("./")
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".csproj") {
-			return file.Name()
-		}
-	}
-	return ""
+//region dotnet
+
+func PushPackage(version string) {
+	abs, _ := filepath.Abs(fmt.Sprintf("./%s/%s.%s.nupkg ", config.OutputDir, config.PackageId, version))
+	CmdAndChangeDirToShow("", "dotnet", "nuget", "push", abs, "-k", config.GetAppKey(), "-s", NugetPushUrl)
+}
+
+func PackPackage(info *NugetPackageInfo) string {
+	p := GetMaxVersion(info)
+	p.PatchIncrease()
+	fmt.Println("New Version", p.Version())
+	pwd, _ := os.Getwd()
+	CmdAndChangeDirToShow(pwd, "dotnet", "pack", fmt.Sprintf("-p:PackageVersion=%s", p.Version()), "--configuration", config.BuildConfiguration, "--output", config.OutputDir)
+	return p.Version()
 }
 
 //endregion
@@ -148,7 +155,7 @@ func (p *PackageVersion) Version() string {
 //region Config
 
 func initFlag() {
-	config = Config{AppKey: "oy2hqo4rn236xmbtqwwa4eql2k2dmtxeth4ja7tvod676y"}
+	config = &Config{}
 
 	//--p=456  or --patch=456 is 456
 	//--p or --patch  -1
@@ -160,32 +167,57 @@ func initFlag() {
 	flag.IntVarP(&config.Patch, "patch", "z", -1, "Patch Number; 1 auto increment; 0 nothing; gt 0 custom; missing is auto increment")
 	flag.Lookup("patch").NoOptDefVal = "-1"
 
-	flag.StringVarP(&config.ProjectFile, "project", "p", "", "csproj file path; nil search current directory")
-	flag.Lookup("project").NoOptDefVal = ""
+	flag.BoolVarP(&config.AutoPush, "push", "p", false, "Auto Push Nuget serve")
+	flag.Lookup("push").NoOptDefVal = "true"
+
+	flag.BoolVarP(&config.NoBuild, "no-build", "n", false, "Doesn't build the project before packing")
+	flag.Lookup("no-build").NoOptDefVal = "true"
+
+	flag.StringVarP(&config.BuildConfiguration, "configuration", "c", "Debug", "Doesn't build the project before packing")
+	flag.Lookup("no-build").NoOptDefVal = "Debug"
+
+	flag.StringVarP(&config.ApiKey, "api-key", "k", "", "push to server apikey")
+	flag.Lookup("api-key").NoOptDefVal = DefaultApi
+
+	flag.StringVarP(&config.ProjectFile, "project", "f", "", "csproj file path; nil search current directory")
 	flag.StringVarP(&config.PackageId, "packageId", "i", "", "csproj file path; nil search current directory")
-	flag.Lookup("packageId").NoOptDefVal = ""
+	flag.StringVarP(&config.OutputDir, "output", "o", "nupkgs", "Places the built packages in the directory specified.")
+
+	flag.StringVar(&config.Des, "des", "", "Use Des Encryption a apiKey")
+
 	flag.Parse()
+
 }
 
 type Config struct {
-	AppKey      string //AppKey 推送使用
-	ProjectFile string //csproj file path nil search ./*csproj first
-	Major       int    // -1 auto increment; 0 nothing; gt 0 custom
-	Minor       int    // -1 auto increment; 0 nothing; gt 0 custom
-	Patch       int    // -1 auto increment; 0 nothing; gt 0 custom
-	Suffix      string // 暂不使用   beta preview
-	PackageId   string // nuget packageId nil find node from ProjectFile
+	ApiKey             string //ApiKey
+	ProjectFile        string //csproj file path nil search ./*csproj first
+	Major              int    // -1 auto increment; 0 nothing; gt 0 custom
+	Minor              int    // -1 auto increment; 0 nothing; gt 0 custom
+	Patch              int    // -1 auto increment; 0 nothing; gt 0 custom
+	Suffix             string // TODO:   beta preview
+	PackageId          string // nuget packageId nil find node from ProjectFile
+	AutoPush           bool   // Auto Push Nuget server
+	NoBuild            bool   // Doesn't build the project before packing
+	OutputDir          string // Places the built packages in the directory specified.
+	BuildConfiguration string // Defines the build configuration. The default for most projects is Debug, but you can override the build configuration settings in your project.
+	Des                string
 }
 
 func (c *Config) GetPackageId() string {
 	if c.PackageId == "" {
-		return FindPackageId(c.ProjectFile)
+		c.PackageId = FindPackageId(c.ProjectFile)
 	}
 	return c.PackageId
 }
 
 func (c *Config) GetAppKey() string {
-	return c.AppKey
+	if IsEncrypt {
+		decodeString, _ := base64.URLEncoding.DecodeString(c.ApiKey)
+		key, _ = DesDecryption(key, iv, []byte(decodeString))
+		return string(key)
+	}
+	return c.ApiKey
 }
 
 //endregion
@@ -193,26 +225,26 @@ func (c *Config) GetAppKey() string {
 //region Nuget pkg
 
 //GetNugetPackageInfo 获取包的版本号
-func GetNugetPackageInfo(packageId string) *NugetPackageInfo {
+func GetNugetPackageInfo(packageId string) (*NugetPackageInfo, error) {
 	cli := http.Client{}
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://api.nuget.org/v3-flatcontainer/%s/index.json", strings.ToLower(packageId)), nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%sv3-flatcontainer/%s/index.json", NugetServer, strings.ToLower(packageId)), nil)
 	if err != nil {
 		fmt.Errorf("Nuget Request Error  %s", err.Error())
-		return nil
+		return nil, err
 	}
 	req.Header.Add("X-NuGet-ApiKey", config.GetAppKey())
 	rep, err := cli.Do(req)
 	if err != nil {
 		fmt.Errorf("Nuget Response Error  %s", err.Error())
-		return nil
+		return nil, err
 	}
 	var result NugetPackageInfo
 	err = json.NewDecoder(rep.Body).Decode(&result)
 	if err != nil {
 		fmt.Errorf("Nuget Json Decoder Error  %s", err.Error())
-		return nil
+		return nil, err
 	}
-	return &result
+	return &result, nil
 }
 
 //NugetPackageInfo Nuget package Info
@@ -224,8 +256,84 @@ type NugetPackageInfo struct {
 
 //region pkg
 
+func FindPackageId(projectFileName string) string {
+	if projectFileName == "" {
+		projectFileName = FindProjectFile()
+		if projectFileName == "" {
+			panic(PackageIdNotConfigError)
+		}
+	}
+	fmt.Println("project file ", projectFileName)
+	doc := etree.NewDocument()
+	if err := doc.ReadFromFile(projectFileName); err != nil {
+		panic(err)
+	}
+	root := doc.SelectElement("Project")
+	for _, element := range root.SelectElements("PropertyGroup") {
+		if packageIdElement := element.SelectElement("PackageId"); packageIdElement != nil {
+			return packageIdElement.Text()
+		}
+	}
+	panic(PackageIdNotConfigError)
+}
+
+func FindProjectFile() string {
+	pwd, _ := os.Getwd()
+	fmt.Println("search project file in ", pwd)
+	files, _ := ioutil.ReadDir(pwd)
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".csproj") {
+			return file.Name()
+		}
+	}
+	return ""
+}
+
 func splitFunc(r rune) bool {
 	return r == '.' || r == '-'
+}
+
+func DesEncryption(key, iv, plainText []byte) ([]byte, error) {
+
+	block, err := des.NewCipher(key)
+
+	if err != nil {
+		return nil, err
+	}
+
+	blockSize := block.BlockSize()
+	origData := PKCS5Padding(plainText, blockSize)
+	blockMode := cipher.NewCBCEncrypter(block, iv)
+	cryted := make([]byte, len(origData))
+	blockMode.CryptBlocks(cryted, origData)
+	return cryted, nil
+}
+
+func DesDecryption(key, iv, cipherText []byte) ([]byte, error) {
+
+	block, err := des.NewCipher(key)
+
+	if err != nil {
+		return nil, err
+	}
+
+	blockMode := cipher.NewCBCDecrypter(block, iv)
+	origData := make([]byte, len(cipherText))
+	blockMode.CryptBlocks(origData, cipherText)
+	origData = PKCS5UnPadding(origData)
+	return origData, nil
+}
+
+func PKCS5Padding(src []byte, blockSize int) []byte {
+	padding := blockSize - len(src)%blockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(src, padtext...)
+}
+
+func PKCS5UnPadding(src []byte) []byte {
+	length := len(src)
+	unpadding := int(src[length-1])
+	return src[:(length - unpadding)]
 }
 
 //endregion
@@ -261,7 +369,6 @@ func ExecShellString(shellString string, dir string) error {
 }
 
 func execCmd(cmd *exec.Cmd) (err error) {
-	fmt.Println(cmd.Path, cmd.Args)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		fmt.Errorf("cmd.StdoutPipe: %s", err.Error())
