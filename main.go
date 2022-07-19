@@ -48,7 +48,7 @@ func main() {
 	fmt.Println("PackageID ", config.GetPackageId())
 	nugetPackageInfo, err := GetNugetPackageInfo(config.GetPackageId())
 	if err != nil {
-		panic(err)
+		nugetPackageInfo = DefaultNugetPackageInfo()
 	}
 	v := PackPackage(nugetPackageInfo)
 	if config.AutoPush {
@@ -250,6 +250,10 @@ func GetNugetPackageInfo(packageId string) (*NugetPackageInfo, error) {
 //NugetPackageInfo Nuget package Info
 type NugetPackageInfo struct {
 	Versions []string `json:"versions"`
+}
+
+func DefaultNugetPackageInfo() *NugetPackageInfo {
+	return &NugetPackageInfo{Versions: []string{"0.0.0"}}
 }
 
 //endregion
